@@ -30,8 +30,10 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-#define BUFF_SIZE		(	   10		)
+#define BUFF_SIZE		(	    10		)
 #define PWM_PERIOD		(     1999		)
+#define TIME_FOR_ALARM	(	  5000		)
+#define TIME_FOR_TOGGLE	(	   300		)
 
 typedef enum _bool_ {
 	OFF,
@@ -46,6 +48,9 @@ typedef enum _events_ {
 	EVT_100,
 	EVT_ADC,
 	EVT_ADC_RECEIVED,
+	EVT_TIME_REACHED,
+	EVT_TIME_TOGGLE,
+	EVT_TIME_STOP_ALARM,
 }events_t;
 
 typedef enum _states_ {
@@ -56,7 +61,7 @@ typedef enum _states_ {
 	STATE_ADC,
 }states_t;
 
-typedef struct _button_ {
+typedef volatile struct _button_ {
 	uint16_t debounc_count;
 	bool_t flag_pressed:1;
 	bool_t flag_maybe_pressed:1;
@@ -103,9 +108,16 @@ led_t user_led = {
 };
 
 typedef struct _fsm_ {
-	events_t event;
+	volatile events_t event;
 	states_t state;
-	bool_t new_event:1;
+	volatile bool_t new_event:1;
+	volatile bool_t start_alarm_counter:1;
+	volatile bool_t start_toggle_counter:1;
+	volatile bool_t start_stop_alarm_counter:1;
+	volatile uint16_t alarm_counter;
+	volatile uint16_t toggle_counter;
+	volatile uint16_t stop_counter;
+	uint32_t pwm_value;
 
 }fsm_t;
 
@@ -181,6 +193,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
 	if (htim->Instance == TIM4) {
+
 		/* after EXTI interrupt is triggered */
 		if ( user_button.flag_maybe_pressed == ON ) {
 			user_button.debounc_count++;
@@ -199,42 +212,65 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 		/* Debouncing ignored */
 		if ( user_button.flag_pressed == ON ) {
 			user_button.flag_pressed =  OFF;
-			user_led.status ^= ON; /* Start heartbeat */
-
+			//user_led.status ^= ON; /* Start heartbeat */
+			fsm.new_event = ON;
 			if ( fsm.state == STATE_0 ) {
-				fsm.new_event = ON;
 				fsm.event = EVT_30;
 			}
 			else if ( fsm.state == STATE_30 ) {
-				fsm.new_event = ON;
 				fsm.event = EVT_70;
 			}
 			else if ( fsm.state == STATE_70 ) {
-				fsm.new_event = ON;
 				fsm.event = EVT_100;
 			}
 			else if ( fsm.state == STATE_100 ) {
-				fsm.new_event = ON;
 				fsm.event = EVT_ADC;
 			}
 			else if ( fsm.state == STATE_ADC ) {
-				fsm.new_event = ON;
 				fsm.event = EVT_0;
 			}
 		}
 
-		if (user_led.status == ON) {
-			user_led.counter++;
+		/* When brightness is over 80% */
+		if ( fsm.start_alarm_counter == ON ) {
+			fsm.alarm_counter++;
 		} else {
-			user_led.counter = 0;
-			HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, OFF);
+			fsm.alarm_counter = 0;
 		}
 
-		if ( user_led.counter >= 1000 ) {
-			user_led.counter = 0;
-			user_led.start_blink = ON;
+		/* 5 secs elapsed */
+		if ( fsm.alarm_counter >= TIME_FOR_ALARM ) {
+			fsm.start_alarm_counter = OFF;
+			fsm.alarm_counter = 0;
+			fsm.event = EVT_TIME_REACHED;
+			fsm.new_event = ON;
 		}
 
+		if ( fsm.start_toggle_counter == ON ) {
+			fsm.toggle_counter++;
+		} else {
+			fsm.toggle_counter = 0;
+		}
+
+		if ( fsm.toggle_counter >= TIME_FOR_TOGGLE ) {
+			fsm.start_toggle_counter = OFF;
+			fsm.toggle_counter = 0;
+			fsm.event = EVT_TIME_TOGGLE;
+			fsm.new_event = ON;
+		}
+
+		if ( fsm.start_stop_alarm_counter == ON ) {
+			fsm.stop_counter++;
+		} else {
+			fsm.stop_counter = 0;
+		}
+
+		if ( fsm.stop_counter >= TIME_FOR_ALARM ) {
+			fsm.start_stop_alarm_counter = OFF;
+			fsm.stop_counter = 0;
+			fsm.event = EVT_TIME_STOP_ALARM;
+			fsm.new_event = ON;
+		}
 	}
 }
 /* USER CODE END 0 */
@@ -287,12 +323,6 @@ int main(void)
 	while (1)
 	{
 		fsm_run(&fsm);
-		if ( user_led.start_blink == ON ) {
-			user_led.start_blink = OFF;
-			HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
-			sprintf((char *)(uart2.tx_buff), "%d\r\n",(int)(adc.value));
-			HAL_UART_Transmit_IT(&huart2, uart2.tx_buff, (uint16_t)strlen((const char *)uart2.tx_buff));
-		}
 		/* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
@@ -579,9 +609,18 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 void fsm_init (fsm_t *fsm) {
+
 	fsm->state = STATE_0;
 	fsm->event = EVT_NO_EVT;
 	fsm->new_event = OFF;
+	fsm->start_alarm_counter = OFF;
+	fsm->alarm_counter = 0;
+	fsm->start_toggle_counter = OFF;
+	fsm->toggle_counter = 0;
+	fsm->start_stop_alarm_counter = OFF;
+	fsm->stop_counter = 0;
+	fsm->pwm_value = 0;
+
 	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
 }
 
@@ -613,6 +652,7 @@ void fsm_run (fsm_t *fsm) {
 
 			if ( fsm->event == EVT_100 ) {
 				__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 1999);
+				fsm->start_alarm_counter = ON;
 				fsm->state = STATE_100;
 			}
 
@@ -621,24 +661,79 @@ void fsm_run (fsm_t *fsm) {
 		case STATE_100:
 
 			if ( fsm->event == EVT_ADC ) {
-				HAL_ADC_Start_IT(&hadc3);
-				fsm->state = STATE_ADC;
-			}
 
+				HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, OFF);
+				fsm->start_alarm_counter = OFF;
+				fsm->start_toggle_counter = OFF;
+				fsm->start_stop_alarm_counter = OFF;
+				fsm->state = STATE_ADC;
+				HAL_ADC_Start_IT(&hadc3);
+
+			} else if ( fsm->event == EVT_TIME_REACHED ) {
+
+				__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
+				HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+				fsm->start_toggle_counter = ON;
+				fsm->start_stop_alarm_counter = ON;
+
+			} else if ( fsm->event == EVT_TIME_TOGGLE ) {
+
+				HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+				fsm->start_toggle_counter = ON;
+
+			} else if ( fsm->event == EVT_TIME_STOP_ALARM ) {
+
+				__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 1999);
+				HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, OFF);
+				fsm->start_toggle_counter = OFF;
+				fsm->start_alarm_counter = ON;
+
+			}
 			break;
 
 		case STATE_ADC:
 
 			if ( fsm->event == EVT_0 ) {
 
+				HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, OFF);
 				__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
 				fsm->state = STATE_0;
 
 			}
 			else if ( fsm->event == EVT_ADC_RECEIVED ) {
 
-				volatile uint32_t pwm_value = (adc.value*1999)/(4050);
-				__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pwm_value);
+				fsm->pwm_value = (adc.value*1999)/(4050);
+				__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, fsm->pwm_value);
+
+				if ( fsm->pwm_value >= 1580 ) { /* over 80% */
+					fsm->start_alarm_counter = ON;
+				} else {
+					fsm->start_alarm_counter = OFF;
+					fsm->start_toggle_counter = OFF;
+					fsm->start_stop_alarm_counter = OFF;
+				}
+				HAL_ADC_Start_IT(&hadc3);
+				fsm->state = STATE_ADC;
+
+
+			} else if ( fsm->event == EVT_TIME_REACHED ) {
+
+				__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
+				HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+				fsm->start_toggle_counter = ON;
+				fsm->start_stop_alarm_counter = ON;
+				fsm->state = STATE_ADC;
+
+			} else if ( fsm->event == EVT_TIME_TOGGLE ) {
+
+				HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+				fsm->start_toggle_counter = ON;
+				fsm->state = STATE_ADC;
+
+			} else if ( fsm->event == EVT_TIME_STOP_ALARM ) {
+
+				HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, OFF);
+				fsm->start_toggle_counter = OFF;
 				HAL_ADC_Start_IT(&hadc3);
 				fsm->state = STATE_ADC;
 
@@ -646,6 +741,10 @@ void fsm_run (fsm_t *fsm) {
 
 			break;
 
+		default: /*ERROR */
+			HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, ON);
+			while(1){}
+			break;
 		}
 
 	}
